@@ -1011,29 +1011,82 @@ function ReceiptScanner({ onParsed }) {
   const [status, setStatus]   = useState("idle"); // idle | scanning | done | error
   const [preview, setPreview] = useState(null);
   const [result,  setResult]  = useState(null);
+  const [errorInfo, setErrorInfo] = useState(null); // { kind, message }
   const fileRef = useRef();
+  const busyRef = useRef(false); // 二重送信防止
 
-  async function handleFile(file) {
-    if (!file) return;
-    setStatus("scanning");
-    setResult(null);
+  // sleep用ユーティリティ（レート制限時の待機に使用）
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-    // プレビュー
-    const reader = new FileReader();
-    reader.onload = e => setPreview(e.target.result);
-    reader.readAsDataURL(file);
+  // レスポンスの中身からエラー種別を判定
+  function classifyError(httpStatus, body) {
+    const type = body?.error?.type || body?.type || "";
+    if (httpStatus === 429 || type === "rate_limit_error") {
+      return { kind: "rate_limit", message: "リクエストが混み合っています。少し時間をおいてから、もう一度お試しください。" };
+    }
+    if (httpStatus === 401 || httpStatus === 403 || type === "authentication_error" || type === "permission_error") {
+      return { kind: "auth", message: "AIサービスの認証設定に問題があります。管理者にAPIキーの設定をご確認いただいてください。" };
+    }
+    if (httpStatus === 402 || type === "invalid_request_error" && /credit|billing/i.test(body?.error?.message || "")) {
+      return { kind: "billing", message: "AIサービスの利用上限に達している可能性があります。管理者にご確認ください。" };
+    }
+    if (httpStatus >= 500) {
+      return { kind: "server", message: "AIサービス側で一時的な問題が発生しています。しばらくしてからもう一度お試しください。" };
+    }
+    return { kind: "unknown", message: "読み取りに失敗しました。画像の向き・明るさを変えてもう一度お試しください。" };
+  }
 
-    // base64変換
-    const b64 = await new Promise((res, rej) => {
-      const r = new FileReader();
-      r.onload  = () => res(r.result.split(",")[1]);
-      r.onerror = () => rej(new Error("読み込み失敗"));
-      r.readAsDataURL(file);
+  // /api/claude を叩き、429の場合のみ1回だけ自動リトライする
+  async function callClaudeWithRetry(body, attempt = 0) {
+    const res = await fetch("/api/claude", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     });
 
-    const mediaType = file.type || "image/jpeg";
+    if (!res.ok) {
+      let errBody = null;
+      try { errBody = await res.json(); } catch { /* JSON以外の応答 */ }
 
-    const prompt = `この領収書・レシートを読み取り、以下のJSON形式のみで返してください。説明文は不要です。
+      // レート制限は少し待って1回だけ再試行（一時的な混雑はこれで解消することが多い）
+      if (res.status === 429 && attempt < 1) {
+        const retryAfterHeader = Number(res.headers.get("retry-after"));
+        const waitMs = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
+          ? retryAfterHeader * 1000
+          : 3000;
+        await sleep(waitMs);
+        return callClaudeWithRetry(body, attempt + 1);
+      }
+
+      const info = classifyError(res.status, errBody);
+      const err = new Error(info.message);
+      err.info = info;
+      throw err;
+    }
+
+    return res.json();
+  }
+
+  async function handleFile(file) {
+    if (!file || busyRef.current) return;
+    busyRef.current = true;
+    setStatus("scanning");
+    setResult(null);
+    setErrorInfo(null);
+
+    try {
+      // プレビュー
+      const preview = await new Promise((res, rej) => {
+        const r = new FileReader();
+        r.onload  = () => res(r.result);
+        r.onerror = () => rej(new Error("画像の読み込みに失敗しました"));
+        r.readAsDataURL(file);
+      });
+      setPreview(preview);
+      const b64 = preview.split(",")[1];
+      const mediaType = file.type || "image/jpeg";
+
+      const prompt = `この領収書・レシートを読み取り、以下のJSON形式のみで返してください。説明文は不要です。
 
 {
   "date": "YYYY-MM-DD形式の日付（不明なら今日）",
@@ -1055,32 +1108,34 @@ function ReceiptScanner({ onParsed }) {
 - labor: 給与・バイト代
 - other: 上記に当てはまらない場合`;
 
-    try {
-      const res = await fetch("/api/claude", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: 300,
-          messages: [{
-            role: "user",
-            content: [
-              { type: "image", source: { type: "base64", media_type: mediaType, data: b64 } },
-              { type: "text",  text: prompt },
-            ],
-          }],
-        }),
+      const data = await callClaudeWithRetry({
+        max_tokens: 300,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: mediaType, data: b64 } },
+            { type: "text",  text: prompt },
+          ],
+        }],
       });
-      const data = await res.json();
+
       const text = data.content?.find(b => b.type === "text")?.text || "";
-      // JSON抽出
       const json = text.match(/\{[\s\S]*\}/)?.[0];
-      if (!json) throw new Error("解析失敗");
+      if (!json) {
+        const err = new Error("領収書の内容をうまく読み取れませんでした。写真を撮り直してお試しください。");
+        err.info = { kind: "parse" };
+        throw err;
+      }
       const parsed = JSON.parse(json);
       setResult(parsed);
       setStatus("done");
     } catch (e) {
+      setErrorInfo(e.info ? e.info : { kind: "unknown", message: e.message || "読み取りに失敗しました。もう一度お試しください。" });
       setStatus("error");
+    } finally {
+      busyRef.current = false;
+      // 同じ写真をもう一度選び直せるように、input自体の選択状態をリセットしておく
+      if (fileRef.current) fileRef.current.value = "";
     }
   }
 
@@ -1096,6 +1151,7 @@ function ReceiptScanner({ onParsed }) {
     setStatus("idle");
     setPreview(null);
     setResult(null);
+    setErrorInfo(null);
   }
 
   const cat = result ? EXPENSE_CATEGORIES.find(c => c.id === result.category) : null;
@@ -1170,8 +1226,20 @@ function ReceiptScanner({ onParsed }) {
 
       {status === "error" && (
         <div style={{ textAlign:"center", padding:"10px 0" }}>
-          <div style={{ fontSize:13, color:"#c0392b", marginBottom:10 }}>読み取りに失敗しました</div>
-          <button style={{ ...S.btnGray }} onClick={()=>{ setStatus("idle"); setPreview(null); }}>もう一度試す</button>
+          <div style={{ fontSize:13, color:"#c0392b", marginBottom:6 }}>
+            {errorInfo?.message || "読み取りに失敗しました"}
+          </div>
+          {errorInfo?.kind === "rate_limit" && (
+            <div style={{ fontSize:11, color:"#666", marginBottom:10 }}>
+              ※ 短時間に連続で読み取りを行うと発生しやすくなります。少し間隔をあけてお試しください。
+            </div>
+          )}
+          {(errorInfo?.kind === "auth" || errorInfo?.kind === "billing") && (
+            <div style={{ fontSize:11, color:"#666", marginBottom:10 }}>
+              ※ この項目は入力フォームから手入力でも登録できます。
+            </div>
+          )}
+          <button style={{ ...S.btnGray }} onClick={()=>{ setStatus("idle"); setPreview(null); setErrorInfo(null); }}>もう一度試す</button>
         </div>
       )}
     </div>

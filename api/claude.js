@@ -44,6 +44,12 @@ export default async function handler(req, res) {
       }),
     });
 
+    // レート制限(429)の場合、Anthropicが返す retry-after をそのままブラウザに伝える
+    const retryAfter = upstream.headers.get("retry-after");
+    if (retryAfter) {
+      res.setHeader("retry-after", retryAfter);
+    }
+
     const data = await upstream.json();
     res.status(upstream.status).json(data);
   } catch (e) {
