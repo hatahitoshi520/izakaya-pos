@@ -1005,17 +1005,53 @@ function DataTab({ ordersData, dailiesData }) {
 }
 
 // =============================================
-// 領収書スキャナー
+// 領収書スキャナー（かざすだけ自動読み取り版）
+// カメラ映像を常時表示し、手ブレが収まった瞬間に自動で1枚だけ撮影→AI読み取り
+// →ボタンタップ無しで入力欄（日付・金額・内容・勘定科目）へ自動反映する。
+// 反映後の最終保存（💾経費を登録する）だけは、誤登録防止のため引き続き手動。
 // =============================================
-function ReceiptScanner({ onParsed }) {
-  const [status, setStatus]   = useState("idle"); // idle | scanning | done | error
-  const [preview, setPreview] = useState(null);
-  const [result,  setResult]  = useState(null);
-  const [errorInfo, setErrorInfo] = useState(null); // { kind, message }
-  const fileRef = useRef();
-  const busyRef = useRef(false); // 二重送信防止
 
-  // sleep用ユーティリティ（レート制限時の待機に使用）
+const RECEIPT_PROMPT = `この領収書・レシートを読み取り、以下のJSON形式のみで返してください。説明文は不要です。
+
+{
+  "date": "YYYY-MM-DD形式の日付（不明なら今日）",
+  "name": "店名または購入内容の要約（20文字以内）",
+  "amount": 合計金額の数値（税込、円記号なし）,
+  "category": "以下から最適なもの1つ: food / labor / rent / util / misc / equip / promo / trans / comm / insure / tax / other",
+  "memo": "品目の簡単なメモ（30文字以内、不明なら空文字）",
+  "confidence": "high / medium / low"
+}
+
+カテゴリの判断基準:
+- food: 食材・飲料・酒類・業務スーパー・魚屋・肉屋など
+- misc: 割り箸・消耗品・洗剤・ゴミ袋・文具など
+- util: 電気・ガス・水道
+- trans: 電車・バス・タクシー・駐車場
+- equip: 調理器具・厨房用品・備品
+- promo: チラシ・広告・SNS広告
+- comm: 電話・インターネット
+- labor: 給与・バイト代
+- other: 上記に当てはまらない場合`;
+
+function ReceiptScanner({ onParsed }) {
+  // idle(未起動) | camera(かざして待機中) | scanning(AI読み取り中) | done(結果表示) | error
+  const [mode, setMode]           = useState("idle");
+  const [preview, setPreview]     = useState(null);
+  const [result,  setResult]      = useState(null);
+  const [errorInfo, setErrorInfo] = useState(null); // { kind, message }
+  const [hint, setHint]           = useState("");
+
+  const videoRef        = useRef(null);
+  const streamRef        = useRef(null);
+  const analyzeCanvasRef = useRef(null); // 手ブレ検知用（縮小画像）
+  const captureCanvasRef = useRef(null); // 実際の撮影用（フル解像度）
+  const fileRef          = useRef(null);
+  const prevFrameRef     = useRef(null);
+  const stableCountRef   = useRef(0);
+  const armedAtRef       = useRef(0);    // カメラ起動/再開した時刻（起動直後の誤検知防止）
+  const lockedRef        = useRef(false); // true の間は手ブレ検知を一時停止（AI読み取り中など）
+  const rafRef           = useRef(null);
+
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
   // レスポンスの中身からエラー種別を判定
@@ -1067,54 +1103,154 @@ function ReceiptScanner({ onParsed }) {
     return res.json();
   }
 
-  async function handleFile(file) {
-    if (!file || busyRef.current) return;
-    busyRef.current = true;
-    setStatus("scanning");
-    setResult(null);
+  // ===== カメラ起動 =====
+  async function startCamera() {
     setErrorInfo(null);
-
     try {
-      // プレビュー
-      const preview = await new Promise((res, rej) => {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 960 } },
+        audio: false,
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+      armCamera();
+    } catch (e) {
+      setErrorInfo({ kind: "camera", message: "カメラを起動できませんでした。ブラウザのカメラ利用許可をご確認いただくか、下の「ファイルを選択」からお試しください。" });
+      setMode("error");
+    }
+  }
+
+  // 手ブレ検知を（再）開始できる状態にする
+  function armCamera() {
+    prevFrameRef.current = null;
+    stableCountRef.current = 0;
+    armedAtRef.current = Date.now();
+    lockedRef.current = false;
+    setResult(null);
+    setPreview(null);
+    setErrorInfo(null);
+    setHint("レシートをカメラにかざしてください");
+    setMode("camera");
+  }
+
+  function stopCamera() {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(t => t.stop());
+      streamRef.current = null;
+    }
+    lockedRef.current = false;
+    setMode("idle");
+    setResult(null);
+    setPreview(null);
+    setErrorInfo(null);
+  }
+
+  // アンマウント時にカメラを確実に止める
+  useEffect(() => {
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
+    };
+  }, []);
+
+  // ===== 手ブレ検知ループ（毎フレーム、縮小画像の差分をチェック） =====
+  useEffect(() => {
+    if (mode !== "camera") return;
+    let active = true;
+
+    const tick = () => {
+      if (!active) return;
+      if (!lockedRef.current && streamRef.current) {
+        const video = videoRef.current;
+        const ac = analyzeCanvasRef.current;
+        if (video && ac && video.videoWidth) {
+          const W = 32, H = 24;
+          ac.width = W; ac.height = H;
+          const ctx = ac.getContext("2d");
+          ctx.drawImage(video, 0, 0, W, H);
+          const frame = ctx.getImageData(0, 0, W, H).data;
+
+          if (prevFrameRef.current) {
+            let diff = 0;
+            for (let i = 0; i < frame.length; i += 4) {
+              diff += Math.abs(frame[i] - prevFrameRef.current[i]);
+            }
+            const avgDiff = diff / (W * H);
+            stableCountRef.current = avgDiff < 6 ? stableCountRef.current + 1 : 0;
+          }
+          prevFrameRef.current = frame;
+
+          // 起動直後（ピント調整中）の誤検知を避けるため、一定時間は待つ
+          const readyToTrigger = Date.now() - armedAtRef.current > 700;
+          if (readyToTrigger && stableCountRef.current >= 6) {
+            stableCountRef.current = 0;
+            lockedRef.current = true;
+            captureAndScan();
+          }
+        }
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+
+    return () => { active = false; if (rafRef.current) cancelAnimationFrame(rafRef.current); };
+  }, [mode]);
+
+  // ===== 静止を検知したら自動で撮影してAIへ送信 =====
+  async function captureAndScan() {
+    const video = videoRef.current;
+    const cc = captureCanvasRef.current;
+    if (!video || !cc || !video.videoWidth) { lockedRef.current = false; return; }
+
+    cc.width = video.videoWidth;
+    cc.height = video.videoHeight;
+    cc.getContext("2d").drawImage(video, 0, 0);
+    const dataUrl = cc.toDataURL("image/jpeg", 0.85);
+
+    await runScan(dataUrl, "image/jpeg");
+  }
+
+  // ===== ファイル選択（カメラが使えない場合のフォールバック） =====
+  async function handleFile(file) {
+    if (!file || lockedRef.current) return;
+    lockedRef.current = true;
+    try {
+      const dataUrl = await new Promise((res, rej) => {
         const r = new FileReader();
         r.onload  = () => res(r.result);
         r.onerror = () => rej(new Error("画像の読み込みに失敗しました"));
         r.readAsDataURL(file);
       });
-      setPreview(preview);
-      const b64 = preview.split(",")[1];
-      const mediaType = file.type || "image/jpeg";
+      await runScan(dataUrl, file.type || "image/jpeg");
+    } catch (e) {
+      setErrorInfo({ kind: "unknown", message: e.message || "読み取りに失敗しました。" });
+      setMode("error");
+      lockedRef.current = false;
+    } finally {
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  }
 
-      const prompt = `この領収書・レシートを読み取り、以下のJSON形式のみで返してください。説明文は不要です。
+  // ===== AI読み取り本体（カメラ自動撮影・ファイル選択どちらからも呼ばれる） =====
+  async function runScan(dataUrl, mediaType) {
+    setPreview(dataUrl);
+    setMode("scanning");
+    setHint("");
 
-{
-  "date": "YYYY-MM-DD形式の日付（不明なら今日）",
-  "name": "店名または購入内容の要約（20文字以内）",
-  "amount": 合計金額の数値（税込、円記号なし）,
-  "category": "以下から最適なもの1つ: food / labor / rent / util / misc / equip / promo / trans / comm / insure / tax / other",
-  "memo": "品目の簡単なメモ（30文字以内、不明なら空文字）",
-  "confidence": "high / medium / low"
-}
-
-カテゴリの判断基準:
-- food: 食材・飲料・酒類・業務スーパー・魚屋・肉屋など
-- misc: 割り箸・消耗品・洗剤・ゴミ袋・文具など
-- util: 電気・ガス・水道
-- trans: 電車・バス・タクシー・駐車場
-- equip: 調理器具・厨房用品・備品
-- promo: チラシ・広告・SNS広告
-- comm: 電話・インターネット
-- labor: 給与・バイト代
-- other: 上記に当てはまらない場合`;
-
+    try {
+      const b64 = dataUrl.split(",")[1];
       const data = await callClaudeWithRetry({
         max_tokens: 300,
         messages: [{
           role: "user",
           content: [
             { type: "image", source: { type: "base64", media_type: mediaType, data: b64 } },
-            { type: "text",  text: prompt },
+            { type: "text",  text: RECEIPT_PROMPT },
           ],
         }],
       });
@@ -1122,110 +1258,112 @@ function ReceiptScanner({ onParsed }) {
       const text = data.content?.find(b => b.type === "text")?.text || "";
       const json = text.match(/\{[\s\S]*\}/)?.[0];
       if (!json) {
-        const err = new Error("領収書の内容をうまく読み取れませんでした。写真を撮り直してお試しください。");
+        const err = new Error("領収書の内容をうまく読み取れませんでした。角度や明るさを変えてもう一度かざしてください。");
         err.info = { kind: "parse" };
         throw err;
       }
       const parsed = JSON.parse(json);
-      setResult(parsed);
-      setStatus("done");
-    } catch (e) {
-      setErrorInfo(e.info ? e.info : { kind: "unknown", message: e.message || "読み取りに失敗しました。もう一度お試しください。" });
-      setStatus("error");
-    } finally {
-      busyRef.current = false;
-      // 同じ写真をもう一度選び直せるように、input自体の選択状態をリセットしておく
-      if (fileRef.current) fileRef.current.value = "";
-    }
-  }
 
-  function applyResult() {
-    if (!result) return;
-    onParsed({
-      date:     result.date || todayKey(),
-      name:     result.name || "",
-      amount:   result.amount ? String(result.amount) : "",
-      category: result.category || "other",
-      memo:     result.memo || "",
-    });
-    setStatus("idle");
-    setPreview(null);
-    setResult(null);
-    setErrorInfo(null);
+      // タップ不要で、読み取り結果をそのまま入力欄へ反映する
+      onParsed({
+        date:     parsed.date || todayKey(),
+        name:     parsed.name || "",
+        amount:   parsed.amount ? String(parsed.amount) : "",
+        category: parsed.category || "other",
+        memo:     parsed.memo || "",
+      });
+
+      setResult(parsed);
+      setMode("done");
+
+      // 結果をしばらく表示してから、タップ不要で次のかざし待機へ自動復帰
+      if (streamRef.current) {
+        await sleep(2400);
+        if (streamRef.current) armCamera();
+      }
+    } catch (e) {
+      setErrorInfo(e.info ? { ...e.info, message: e.message } : { kind: "unknown", message: e.message || "読み取りに失敗しました。もう一度お試しください。" });
+      setMode("error");
+
+      // カメラ起動中なら、数秒後にタップ不要で自動的に再挑戦できる状態へ戻す
+      if (streamRef.current) {
+        await sleep(3200);
+        if (streamRef.current) armCamera();
+      } else {
+        lockedRef.current = false;
+      }
+    }
   }
 
   const cat = result ? EXPENSE_CATEGORIES.find(c => c.id === result.category) : null;
   const confColor = { high: "#5b8c5a", medium: "#d4a017", low: "#c0392b" };
+  const showCameraView = mode === "camera" || mode === "scanning" || (mode === "done" && streamRef.current);
 
   return (
     <div style={{ background:"#110e07", border:"1.5px solid #3a2e18", borderRadius:14, padding:14, marginBottom:4 }}>
-      <div style={{ fontSize:13, fontWeight:"bold", color:"#c8a96e", marginBottom:10 }}>📸 領収書スキャン</div>
+      <div style={{ fontSize:13, fontWeight:"bold", color:"#c8a96e", marginBottom:10 }}>📸 領収書スキャン（かざすだけ）</div>
 
-      {status === "idle" && (
+      {mode === "idle" && (
         <div>
-          <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{ display:"none" }}
+          <input ref={fileRef} type="file" accept="image/*" style={{ display:"none" }}
             onChange={e => handleFile(e.target.files[0])} />
           <div style={{ display:"flex", gap:8 }}>
-            <button style={{ ...S.btnGold, flex:1, background:"linear-gradient(135deg,#7b5ea7,#5b3d8f)", fontSize:13 }}
-              onClick={() => { fileRef.current.setAttribute("capture","environment"); fileRef.current.click(); }}>
-              📷 カメラで撮影
+            <button style={{ ...S.btnGold, flex:2, background:"linear-gradient(135deg,#7b5ea7,#5b3d8f)", fontSize:13 }}
+              onClick={startCamera}>
+              📷 カメラをかざして読み取る
             </button>
             <button style={{ ...S.btnGold, flex:1, background:"#1a1208", border:"1px solid #3a2e18", color:"#888", fontSize:13 }}
-              onClick={() => { fileRef.current.removeAttribute("capture"); fileRef.current.click(); }}>
-              🖼 ファイルを選択
+              onClick={() => fileRef.current.click()}>
+              🖼 ファイル
             </button>
           </div>
           <div style={{ fontSize:10, color:"#555", marginTop:6, textAlign:"center" }}>
-            レシート・領収書を撮影すると自動で仕分けします
+            レシートをカメラにかざすだけで、タップ不要で日付・金額・勘定科目を自動読み取りします
           </div>
         </div>
       )}
 
-      {status === "scanning" && (
-        <div style={{ textAlign:"center", padding:"16px 0" }}>
-          {preview && <img src={preview} alt="receipt" style={{ width:"100%", maxHeight:160, objectFit:"contain", borderRadius:8, marginBottom:10, opacity:0.6 }} />}
-          <div style={{ fontSize:24, marginBottom:8 }}>🧠</div>
-          <div style={{ fontSize:13, color:"#888" }}>AIが領収書を読み取り中...</div>
-        </div>
-      )}
+      {showCameraView && (
+        <div style={{ position:"relative" }}>
+          <video ref={videoRef} playsInline muted
+            style={{ width:"100%", borderRadius:8, background:"#000", display:"block" }} />
+          <canvas ref={analyzeCanvasRef} style={{ display:"none" }} />
+          <canvas ref={captureCanvasRef} style={{ display:"none" }} />
 
-      {status === "done" && result && (
-        <div>
-          <div style={{ display:"flex", gap:10, marginBottom:10 }}>
-            {preview && <img src={preview} alt="receipt" style={{ width:80, height:80, objectFit:"cover", borderRadius:8, flexShrink:0 }} />}
-            <div style={{ flex:1, display:"flex", flexDirection:"column", gap:6 }}>
-              {/* 読み取り結果 */}
-              <div style={{ background:"#1a1208", border:"1px solid #2a2010", borderRadius:8, padding:10 }}>
-                <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
-                  <span style={{ fontSize:11, color:"#888" }}>読み取り結果</span>
-                  <span style={{ fontSize:10, color: confColor[result.confidence]||"#888", border:`1px solid ${confColor[result.confidence]||"#555"}`, borderRadius:10, padding:"1px 6px" }}>
-                    精度: {result.confidence==="high"?"高":result.confidence==="medium"?"中":"低"}
-                  </span>
-                </div>
-                <div style={{ fontSize:13, marginBottom:3 }}>📅 {result.date}</div>
-                <div style={{ fontSize:13, fontWeight:"bold", marginBottom:3 }}>{result.name}</div>
-                <div style={{ fontSize:18, fontWeight:"bold", color:"#c0392b", marginBottom:3 }}>▼{result.amount?.toLocaleString()}円</div>
-                <div style={{ fontSize:11, color: cat?.color||"#888" }}>{cat?.icon} {cat?.label}</div>
-                {result.memo && <div style={{ fontSize:11, color:"#666", marginTop:3 }}>📝 {result.memo}</div>}
-              </div>
+          {mode === "camera" && (
+            <div style={{ position:"absolute", left:0, right:0, bottom:0, padding:"6px 10px", background:"linear-gradient(0deg,rgba(0,0,0,.75),transparent)", color:"#c8a96e", fontSize:12, textAlign:"center" }}>
+              {hint}
             </div>
-          </div>
-          <div style={{ display:"flex", gap:8 }}>
-            <button style={{ ...S.btnGray, flex:1 }} onClick={()=>{ setStatus("idle"); setPreview(null); setResult(null); }}>
-              やり直す
-            </button>
-            <button style={{ ...S.btnGold, flex:2, fontSize:14 }} onClick={applyResult}>
-              ✅ この内容で入力欄に反映
-            </button>
-          </div>
-          <div style={{ fontSize:10, color:"#555", marginTop:6, textAlign:"center" }}>
-            反映後に内容を確認・修正してから登録してください
-          </div>
+          )}
+          {mode === "scanning" && (
+            <div style={{ position:"absolute", inset:0, background:"rgba(0,0,0,.55)", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center" }}>
+              <div style={{ fontSize:26, marginBottom:6 }}>🧠</div>
+              <div style={{ fontSize:12, color:"#eee" }}>AIが読み取り中...</div>
+            </div>
+          )}
+          {mode === "done" && result && (
+            <div style={{ position:"absolute", left:0, right:0, bottom:0, padding:"8px 10px", background:"rgba(10,8,4,.92)", borderTop:`2px solid ${confColor[result.confidence]||"#5b8c5a"}` }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:3 }}>
+                <span style={{ fontSize:11, color:"#5b8c5a" }}>✅ 入力欄に自動反映しました</span>
+                <span style={{ fontSize:10, color: confColor[result.confidence]||"#888" }}>精度: {result.confidence==="high"?"高":result.confidence==="medium"?"中":"低"}</span>
+              </div>
+              <div style={{ fontSize:12, color:"#eee" }}>
+                📅{result.date}　{cat?.icon} {cat?.label}　<span style={{ fontWeight:"bold" }}>¥{result.amount?.toLocaleString()}</span>
+              </div>
+              <div style={{ fontSize:10, color:"#888", marginTop:2 }}>{result.name}{result.memo ? `（${result.memo}）` : ""}</div>
+            </div>
+          )}
+
+          <button onClick={stopCamera}
+            style={{ position:"absolute", top:8, right:8, width:28, height:28, borderRadius:"50%", border:"none", background:"rgba(0,0,0,.6)", color:"#fff", fontSize:13, cursor:"pointer" }}>
+            ✕
+          </button>
         </div>
       )}
 
-      {status === "error" && (
+      {mode === "error" && (
         <div style={{ textAlign:"center", padding:"10px 0" }}>
+          {preview && <img src={preview} alt="receipt" style={{ width:"100%", maxHeight:140, objectFit:"contain", borderRadius:8, marginBottom:10, opacity:0.6 }} />}
           <div style={{ fontSize:13, color:"#c0392b", marginBottom:6 }}>
             {errorInfo?.message || "読み取りに失敗しました"}
           </div>
@@ -1234,12 +1372,24 @@ function ReceiptScanner({ onParsed }) {
               ※ 短時間に連続で読み取りを行うと発生しやすくなります。少し間隔をあけてお試しください。
             </div>
           )}
+          {errorInfo?.kind === "camera" && (
+            <div style={{ fontSize:11, color:"#666", marginBottom:10 }}>
+              ※ この項目は入力フォームから手入力でも登録できます。
+            </div>
+          )}
           {(errorInfo?.kind === "auth" || errorInfo?.kind === "billing") && (
             <div style={{ fontSize:11, color:"#666", marginBottom:10 }}>
               ※ この項目は入力フォームから手入力でも登録できます。
             </div>
           )}
-          <button style={{ ...S.btnGray }} onClick={()=>{ setStatus("idle"); setPreview(null); setErrorInfo(null); }}>もう一度試す</button>
+          <div style={{ display:"flex", gap:8, justifyContent:"center" }}>
+            <button style={{ ...S.btnGray }} onClick={() => { streamRef.current ? armCamera() : (setMode("idle"), setPreview(null), setErrorInfo(null)); }}>
+              もう一度試す
+            </button>
+            {streamRef.current && (
+              <button style={{ ...S.btnGray }} onClick={stopCamera}>閉じる</button>
+            )}
+          </div>
         </div>
       )}
     </div>
