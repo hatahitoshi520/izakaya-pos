@@ -1276,10 +1276,15 @@ function ReceiptScanner({ onParsed }) {
       setResult(parsed);
       setMode("done");
 
-      // 結果をしばらく表示してから、タップ不要で次のかざし待機へ自動復帰
+      // 結果をしばらく表示してから、タップ不要で自動的に片付ける
+      await sleep(2400);
       if (streamRef.current) {
-        await sleep(2400);
-        if (streamRef.current) armCamera();
+        armCamera(); // カメラ起動中なら次のかざし待機へ
+      } else {
+        setMode("idle"); // ファイル選択で読み取った場合はアイドルへ戻す
+        setResult(null);
+        setPreview(null);
+        lockedRef.current = false;
       }
     } catch (e) {
       setErrorInfo(e.info ? { ...e.info, message: e.message } : { kind: "unknown", message: e.message || "読み取りに失敗しました。もう一度お試しください。" });
@@ -1320,6 +1325,24 @@ function ReceiptScanner({ onParsed }) {
           <div style={{ fontSize:10, color:"#555", marginTop:6, textAlign:"center" }}>
             レシートをカメラにかざすだけで、タップ不要で日付・金額・勘定科目を自動読み取りします
           </div>
+        </div>
+      )}
+
+      {mode === "done" && result && !streamRef.current && (
+        <div>
+          <div style={{ display:"flex", gap:10, marginBottom:10 }}>
+            {preview && <img src={preview} alt="receipt" style={{ width:80, height:80, objectFit:"cover", borderRadius:8, flexShrink:0 }} />}
+            <div style={{ flex:1, background:"#1a1208", border:`1px solid ${confColor[result.confidence]||"#2a2010"}`, borderRadius:8, padding:10 }}>
+              <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 }}>
+                <span style={{ fontSize:11, color:"#5b8c5a" }}>✅ 入力欄に自動反映しました</span>
+                <span style={{ fontSize:10, color: confColor[result.confidence]||"#888" }}>精度: {result.confidence==="high"?"高":result.confidence==="medium"?"中":"低"}</span>
+              </div>
+              <div style={{ fontSize:13, marginBottom:2 }}>📅 {result.date}　{cat?.icon} {cat?.label}</div>
+              <div style={{ fontSize:16, fontWeight:"bold", color:"#c0392b" }}>¥{result.amount?.toLocaleString()}</div>
+              <div style={{ fontSize:11, color:"#888", marginTop:2 }}>{result.name}{result.memo ? `（${result.memo}）` : ""}</div>
+            </div>
+          </div>
+          <div style={{ fontSize:10, color:"#555", textAlign:"center" }}>内容を確認・修正してから登録してください</div>
         </div>
       )}
 
