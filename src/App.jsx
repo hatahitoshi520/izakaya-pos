@@ -1106,22 +1106,45 @@ function ReceiptScanner({ onParsed }) {
   // ===== カメラ起動 =====
   async function startCamera() {
     setErrorInfo(null);
+
+    // ブラウザがカメラAPIに対応しているか（HTTP経由やアプリ内ブラウザ等では
+    // navigator.mediaDevices 自体が存在しないことがある）
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setErrorInfo({ kind: "camera", message: "このブラウザ・接続方法ではカメラを利用できません。標準のブラウザ(Safari／Chromeなど)でhttpsのURLを開いた上で、下の「ファイル」からお試しください。" });
+      setMode("error");
+      return;
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 960 } },
         audio: false,
       });
       streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-      }
+      // <video> 要素はカメラ待機モードになってから初めて描画されるため、
+      // ストリームの紐付けはその描画後（下のuseEffect）で行う。
       armCamera();
     } catch (e) {
-      setErrorInfo({ kind: "camera", message: "カメラを起動できませんでした。ブラウザのカメラ利用許可をご確認いただくか、下の「ファイルを選択」からお試しください。" });
+      const message = e && e.name === "NotAllowedError"
+        ? "カメラの利用が許可されていません。ブラウザのアドレスバー付近のカメラアイコンから許可するか、端末の設定でこのサイトのカメラ利用を許可してください。"
+        : e && e.name === "NotFoundError"
+        ? "カメラが見つかりませんでした。下の「ファイル」から写真を選んでお試しください。"
+        : "カメラを起動できませんでした。ブラウザのカメラ利用許可をご確認いただくか、下の「ファイルを選択」からお試しください。";
+      setErrorInfo({ kind: "camera", message });
       setMode("error");
     }
   }
+
+  // <video> が実際に画面へ描画された（mode==="camera"になった）後に、
+  // 取得済みのストリームを紐付けて再生する。
+  useEffect(() => {
+    if (mode !== "camera") return;
+    const video = videoRef.current;
+    const stream = streamRef.current;
+    if (!video || !stream) return;
+    video.srcObject = stream;
+    video.play().catch(() => { /* 自動再生が拒否された場合も、後続のタップ等で再生されるため無視 */ });
+  }, [mode]);
 
   // 手ブレ検知を（再）開始できる状態にする
   function armCamera() {
