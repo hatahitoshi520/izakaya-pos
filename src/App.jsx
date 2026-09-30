@@ -1011,10 +1011,11 @@ function DataTab({ ordersData, dailiesData }) {
 // 反映後の最終保存（💾経費を登録する）だけは、誤登録防止のため引き続き手動。
 // =============================================
 
-const RECEIPT_PROMPT = `この領収書・レシートを読み取り、以下のJSON形式のみで返してください。説明文は不要です。
+const RECEIPT_PROMPT = `この画像が領収書・レシートかどうかを判別し、以下のJSON形式のみで返してください。説明文は不要です。
 
 {
-  "date": "YYYY-MM-DD形式の日付（不明なら今日）",
+  "isReceipt": 領収書・レシートが写っているかどうか（true/false。手・机・関係ない写真などはfalse）,
+  "date": "YYYY-MM-DD形式の日付（不明なら今日。isReceiptがfalseならnull可）",
   "name": "店名または購入内容の要約（20文字以内）",
   "amount": 合計金額の数値（税込、円記号なし）,
   "category": "以下から最適なもの1つ: food / labor / rent / util / misc / equip / promo / trans / comm / insure / tax / other",
@@ -1022,7 +1023,11 @@ const RECEIPT_PROMPT = `この領収書・レシートを読み取り、以下�
   "confidence": "high / medium / low"
 }
 
-カテゴリの判断基準:
+isReceiptの判断基準:
+- 領収書・レシート・請求書など、店名・日付・金額が書かれた紙が写っている → true
+- 手・顔・机・壁・商品そのもの・関係ない書類など、領収書が写っていない → false（この場合、他の項目は適当な値でよい）
+
+カテゴリの判断基準（isReceiptがtrueの場合のみ使用):
 - food: 食材・飲料・酒類・業務スーパー・魚屋・肉屋など
 - misc: 割り箸・消耗品・洗剤・ゴミ袋・文具など
 - util: 電気・ガス・水道
@@ -1287,7 +1292,24 @@ function ReceiptScanner({ onParsed }) {
       }
       const parsed = JSON.parse(json);
 
-      // タップ不要で、読み取り結果をそのまま入力欄へ反映する
+      // まず「そもそも領収書が写っているか」を判別する。写っていなければ
+      // 登録は行わず、静かに監視を続ける（誤登録防止）。
+      if (parsed.isReceipt === false) {
+        setPreview(null);
+        if (streamRef.current) {
+          setHint("レシートが見つかりませんでした。かざし直してください");
+          setMode("camera");
+          await sleep(1400);
+          if (streamRef.current) armCamera();
+        } else {
+          setErrorInfo({ kind: "not_receipt", message: "レシート・領収書が見つかりませんでした。別の写真でお試しください。" });
+          setMode("error");
+          lockedRef.current = false;
+        }
+        return;
+      }
+
+      // タップ不要で、読み取り結果をそのまま入力欄（スキャン一覧）へ反映する
       onParsed({
         date:     parsed.date || todayKey(),
         name:     parsed.name || "",
@@ -1410,7 +1432,7 @@ function ReceiptScanner({ onParsed }) {
       {mode === "error" && (
         <div style={{ textAlign:"center", padding:"10px 0" }}>
           {preview && <img src={preview} alt="receipt" style={{ width:"100%", maxHeight:140, objectFit:"contain", borderRadius:8, marginBottom:10, opacity:0.6 }} />}
-          <div style={{ fontSize:13, color:"#c0392b", marginBottom:6 }}>
+          <div style={{ fontSize:13, color: errorInfo?.kind === "not_receipt" ? "#c8a96e" : "#c0392b", marginBottom:6 }}>
             {errorInfo?.message || "読み取りに失敗しました"}
           </div>
           {errorInfo?.kind === "rate_limit" && (
@@ -1495,6 +1517,10 @@ function AccountingTab({ ordersData }) {
   const [form, setForm] = useState({ date: todayKey(), category: "food", name: "", amount: "", memo: "" });
   const [showQuickEdit, setShowQuickEdit] = useState(null); // quickItem id
 
+  // 領収書スキャンで読み取ったが、まだ登録していないもの（まとめて登録用の一覧）
+  const [scanQueue, setScanQueue] = useState([]);
+  const [editingQid, setEditingQid] = useState(null); // 一覧内で今修正中の項目
+
   // load expenses from shared storage
   useEffect(() => {
     (async () => {
@@ -1567,6 +1593,48 @@ function AccountingTab({ ordersData }) {
     const rec = { id: Date.now(), date: form.date, category: form.category, name: form.name, amount: parseInt(form.amount), memo: form.memo };
     await persistExp([rec, ...expData]);
     setForm(f => ({ ...f, name: "", amount: "", memo: "" }));
+  }
+
+  // 領収書スキャンの読み取り結果を一覧に追加する（登録はまだしない）
+  function addToScanQueue(parsed) {
+    setScanQueue(q => [
+      ...q,
+      {
+        qid: Date.now() + Math.random(),
+        date:     parsed.date || todayKey(),
+        name:     parsed.name || "",
+        amount:   parsed.amount ? String(parsed.amount) : "",
+        category: parsed.category || "other",
+        memo:     parsed.memo || "",
+      },
+    ]);
+  }
+
+  function updateScanQueueItem(qid, patch) {
+    setScanQueue(q => q.map(item => item.qid === qid ? { ...item, ...patch } : item));
+  }
+
+  function removeScanQueueItem(qid) {
+    setScanQueue(q => q.filter(item => item.qid !== qid));
+    setEditingQid(cur => cur === qid ? null : cur);
+  }
+
+  // スキャン一覧をまとめて経費として登録する
+  async function addScanQueueBulk() {
+    const valid = scanQueue.filter(item => item.amount && item.name);
+    if (valid.length === 0) return;
+    const recs = valid.map((item, i) => ({
+      id: Date.now() + i,
+      date: item.date,
+      category: item.category,
+      name: item.name,
+      amount: parseInt(item.amount) || 0,
+      memo: item.memo,
+    }));
+    await persistExp([...recs.reverse(), ...expData]);
+    // 金額・内容が未入力のまま残ったものは一覧に残す（間違って消さないように）
+    setScanQueue(q => q.filter(item => !(item.amount && item.name)));
+    setEditingQid(null);
   }
 
   async function addQuickExpense(q, amount) {
@@ -1722,10 +1790,86 @@ function AccountingTab({ ordersData }) {
         <div>
           <div style={{ fontSize:13, fontWeight:"bold", color:"#c8a96e", marginBottom:12 }}>➕ 経費を追加</div>
 
-          {/* 領収書スキャン */}
-          <ReceiptScanner onParsed={(parsed)=>setForm(f=>({...f,...parsed}))} />
+          {/* 領収書スキャン（かざすだけで、まずこの下の一覧に追加される） */}
+          <ReceiptScanner onParsed={addToScanQueue} />
 
-          <div style={{ display:"flex", flexDirection:"column", gap:10, marginTop:16 }}>
+          {/* スキャン済み一覧（まとめて登録） */}
+          {scanQueue.length > 0 && (
+            <div style={{ marginTop:12, background:"#110e07", border:"1.5px solid #3a2e18", borderRadius:14, padding:14 }}>
+              <div style={{ fontSize:13, fontWeight:"bold", color:"#c8a96e", marginBottom:10 }}>
+                📋 スキャン済み（未登録）{scanQueue.length}件
+              </div>
+
+              <div style={{ display:"flex", flexDirection:"column", gap:8, marginBottom:12 }}>
+                {scanQueue.map(item => {
+                  const qcat = EXPENSE_CATEGORIES.find(c => c.id === item.category);
+                  const isEditing = editingQid === item.qid;
+                  return (
+                    <div key={item.qid} style={{ background:"#1a1208", border:"1px solid #2a2010", borderRadius:8, padding:10 }}>
+                      {!isEditing ? (
+                        <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                          <div style={{ flex:1, minWidth:0 }}>
+                            <div style={{ fontSize:11, color:"#888" }}>
+                              📅 {item.date}　<span style={{ color: qcat?.color||"#888" }}>{qcat?.icon} {qcat?.label}</span>
+                            </div>
+                            <div style={{ fontSize:13, fontWeight:"bold", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                              {item.name || "（内容なし）"}
+                            </div>
+                          </div>
+                          <div style={{ fontSize:15, fontWeight:"bold", color: item.amount ? "#c0392b" : "#c0392b88", whiteSpace:"nowrap" }}>
+                            {item.amount ? `¥${Number(item.amount).toLocaleString()}` : "金額未入力"}
+                          </div>
+                          <button style={{ background:"none", border:"none", color:"#888", fontSize:15, cursor:"pointer", padding:4 }}
+                            onClick={() => setEditingQid(item.qid)}>✎</button>
+                          <button style={{ background:"none", border:"none", color:"#c0392b", fontSize:15, cursor:"pointer", padding:4 }}
+                            onClick={() => removeScanQueueItem(item.qid)}>✕</button>
+                        </div>
+                      ) : (
+                        <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+                          <div style={{ display:"flex", gap:8 }}>
+                            <input type="date" style={{ ...S.input, flex:1 }} value={item.date}
+                              onChange={e => updateScanQueueItem(item.qid, { date: e.target.value })} />
+                            <input type="number" style={{ ...S.input, flex:1 }} placeholder="金額" value={item.amount}
+                              onChange={e => updateScanQueueItem(item.qid, { amount: e.target.value })} />
+                          </div>
+                          <input style={S.input} placeholder="内容" value={item.name}
+                            onChange={e => updateScanQueueItem(item.qid, { name: e.target.value })} />
+                          <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+                            {EXPENSE_CATEGORIES.map(cat=>(
+                              <button key={cat.id} style={{ padding:"5px 8px", borderRadius:20, border:`1.5px solid ${item.category===cat.id ? cat.color : "#2a2010"}`, background: item.category===cat.id ? cat.color+"33" : "#0d0a06", color: item.category===cat.id ? cat.color : "#666", fontSize:10, cursor:"pointer" }}
+                                onClick={() => updateScanQueueItem(item.qid, { category: cat.id })}>
+                                {cat.icon} {cat.label}
+                              </button>
+                            ))}
+                          </div>
+                          <div style={{ display:"flex", gap:8 }}>
+                            <button style={{ ...S.btnGray, flex:1 }} onClick={() => removeScanQueueItem(item.qid)}>✕ 削除</button>
+                            <button style={{ ...S.btnGold, flex:2 }} onClick={() => setEditingQid(null)}>✓ 修正完了</button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              <button style={{ ...S.btnGold, fontSize:14, opacity: scanQueue.every(i=>!i.amount||!i.name) ? 0.4 : 1 }}
+                onClick={addScanQueueBulk} disabled={scanQueue.every(i=>!i.amount||!i.name)}>
+                💾 まとめて登録する（{scanQueue.filter(i=>i.amount&&i.name).length}件）
+              </button>
+              <div style={{ fontSize:10, color:"#555", marginTop:6, textAlign:"center" }}>
+                内容を確認・修正してからまとめて登録してください
+              </div>
+            </div>
+          )}
+
+          <div style={{ display:"flex", alignItems:"center", gap:8, marginTop:20, marginBottom:4 }}>
+            <div style={{ flex:1, height:1, background:"#2a2010" }} />
+            <div style={{ fontSize:11, color:"#666" }}>✍️ 手入力で1件だけ追加</div>
+            <div style={{ flex:1, height:1, background:"#2a2010" }} />
+          </div>
+
+          <div style={{ display:"flex", flexDirection:"column", gap:10, marginTop:8 }}>
             <div>
               <div style={S.formLabel}>日付</div>
               <input type="date" style={S.input} value={form.date} onChange={e=>setForm(f=>({...f,date:e.target.value}))} />
