@@ -1009,7 +1009,9 @@ function DataTab({ ordersData, dailiesData }) {
 // 喫茶すずPOSで実運用を通じて磨き込んだ読み取りロジック（白紙の事前判定・
 // 自動リトライ・領収書番号の抽出・読み取れない場合は写真付きで手入力へ
 // 回す仕組み）を移植したもの。APIキーを安全にサーバー側だけに保持する
-// 居酒屋POSの方式（/api/claude 経由）はそのまま維持している。
+// 居酒屋POSの方式（サーバー関数経由でのみAPIを叩く）はそのまま維持して
+// いる。AIはGoogle Gemini（/api/gemini 経由）を使用。無料枠の範囲で
+// 継続利用できるようにするため（Anthropicは継続的な無料枠が無いため）。
 // カメラ映像を常時表示し、枠内に白っぽい紙（レシートらしきもの）が入って
 // 静止した瞬間に自動で1枚だけ撮影→AI読み取り→タップ不要で「スキャン
 // 済み一覧」へ追加する。最終登録（💾まとめて登録する）だけは、誤登録
@@ -1081,17 +1083,14 @@ function ReceiptScanner({ onParsed }) {
 
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-  // レスポンスの中身からエラー種別を判定
+  // レスポンスの中身からエラー種別を判定（Gemini APIのエラー形式に対応）
   function classifyError(httpStatus, body) {
-    const type = body?.error?.type || body?.type || "";
-    if (httpStatus === 429 || type === "rate_limit_error") {
-      return { kind: "rate_limit", message: "リクエストが混み合っています。少し時間をおいてから、もう一度お試しください。" };
+    const status = body?.error?.status || "";
+    if (httpStatus === 429 || status === "RESOURCE_EXHAUSTED") {
+      return { kind: "rate_limit", message: "リクエストが混み合っています（無料枠の上限に達した可能性があります）。少し時間をおいてから、もう一度お試しください。" };
     }
-    if (httpStatus === 401 || httpStatus === 403 || type === "authentication_error" || type === "permission_error") {
+    if (httpStatus === 401 || httpStatus === 403 || status === "PERMISSION_DENIED" || status === "UNAUTHENTICATED") {
       return { kind: "auth", message: "AIサービスの認証設定に問題があります。管理者にAPIキーの設定をご確認いただいてください。" };
-    }
-    if (httpStatus === 402 || type === "invalid_request_error" && /credit|billing/i.test(body?.error?.message || "")) {
-      return { kind: "billing", message: "AIサービスの利用上限に達している可能性があります。管理者にご確認ください。" };
     }
     if (httpStatus >= 500) {
       return { kind: "server", message: "AIサービス側で一時的な問題が発生しています。しばらくしてからもう一度お試しください。" };
@@ -1099,10 +1098,11 @@ function ReceiptScanner({ onParsed }) {
     return { kind: "unknown", message: "読み取りに失敗しました。画像の向き・明るさを変えてもう一度お試しください。" };
   }
 
-  // /api/claude を叩き、429の場合のみ1回だけ自動リトライする
-  // （APIキーはサーバー側だけに保持され、ブラウザには一切渡らない）
-  async function callClaudeWithRetry(body, attempt = 0) {
-    const res = await fetch("/api/claude", {
+  // /api/gemini を叩き、429（無料枠のレート制限）の場合のみ1回だけ自動リトライする
+  // （APIキーはサーバー側だけに保持され、ブラウザには一切渡らない。
+  //   Google AI Studioの無料枠を使うため、通常の利用量なら費用は発生しない）
+  async function callGeminiWithRetry(body, attempt = 0) {
+    const res = await fetch("/api/gemini", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -1113,12 +1113,8 @@ function ReceiptScanner({ onParsed }) {
       try { errBody = await res.json(); } catch { /* JSON以外の応答 */ }
 
       if (res.status === 429 && attempt < 1) {
-        const retryAfterHeader = Number(res.headers.get("retry-after"));
-        const waitMs = Number.isFinite(retryAfterHeader) && retryAfterHeader > 0
-          ? retryAfterHeader * 1000
-          : 3000;
-        await sleep(waitMs);
-        return callClaudeWithRetry(body, attempt + 1);
+        await sleep(4000); // 無料枠のレート制限（1分あたりの回数制限）を想定した待機
+        return callGeminiWithRetry(body, attempt + 1);
       }
 
       const info = classifyError(res.status, errBody);
@@ -1134,17 +1130,17 @@ function ReceiptScanner({ onParsed }) {
   // 全テキストブロックを結合してから { … } の範囲だけを取り出す。
   async function analyzeReceipt(dataUrl, mediaType) {
     const b64 = dataUrl.split(",")[1];
-    const data = await callClaudeWithRetry({
-      max_tokens: 500,
-      messages: [{
+    const data = await callGeminiWithRetry({
+      contents: [{
         role: "user",
-        content: [
-          { type: "image", source: { type: "base64", media_type: mediaType, data: b64 } },
-          { type: "text",  text: RECEIPT_PROMPT },
+        parts: [
+          { inline_data: { mime_type: mediaType, data: b64 } },
+          { text: RECEIPT_PROMPT },
         ],
       }],
+      generationConfig: { maxOutputTokens: 800, responseMimeType: "application/json" },
     });
-    const text = (data.content || []).map(b => b.type === "text" ? b.text : "").filter(Boolean).join("\n").trim();
+    const text = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || "").filter(Boolean).join("\n").trim();
     const fenceStripped = text.replace(/```json|```/g, "").trim();
     const s = fenceStripped.indexOf("{"), e = fenceStripped.lastIndexOf("}");
     const jsonSlice = s !== -1 && e !== -1 ? fenceStripped.slice(s, e + 1) : fenceStripped;
