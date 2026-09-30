@@ -1138,7 +1138,10 @@ function ReceiptScanner({ onParsed }) {
           { text: RECEIPT_PROMPT },
         ],
       }],
-      generationConfig: { maxOutputTokens: 800, responseMimeType: "application/json" },
+      // Gemini 3.8 Flashは出力前の「思考」にもトークンを消費するため、
+      // JSON本文だけを想定した少ないトークン数だと出力前に打ち切られて
+      // しまう。十分な余裕を持たせる。
+      generationConfig: { maxOutputTokens: 3000, responseMimeType: "application/json" },
     });
     const text = (data.candidates?.[0]?.content?.parts || []).map(p => p.text || "").filter(Boolean).join("\n").trim();
     const fenceStripped = text.replace(/```json|```/g, "").trim();
