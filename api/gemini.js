@@ -7,7 +7,7 @@
 // 必要な環境変数（Vercelのプロジェクト設定 > Environment Variables で設定）:
 //   GEMINI_API_KEY ... Google AI Studio(aistudio.google.com)で発行した
 //                      無料のAPIキー（必須・シークレット）
-//   GEMINI_MODEL   ... 使用するモデル名（任意、未設定なら gemini-3.8-flash）
+//   GEMINI_MODEL   ... 使用するモデル名（任意、未設定なら gemini-2.5-flash）
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -21,7 +21,7 @@ export default async function handler(req, res) {
     return;
   }
 
-  const model = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+  const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
   try {
     const { contents, generationConfig } = req.body || {};
