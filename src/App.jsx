@@ -70,7 +70,18 @@ const MENU = {
     label: "🎉 1000べろ", color: "#c0392b",
     items: [{ id: "sp1", name: "1000べろセット", price: 1000, special: true }],
   },
+  oden: {
+    label: "🍲 おでん", color: "#b5651d",
+    items: [
+      { id: "od1", name: "おでん(松)", price: 600, odenSet: true },
+      { id: "od2", name: "おでん(竹)", price: 900, odenSet: true },
+      { id: "od3", name: "おでん(梅)", price: 1200, odenSet: true },
+    ],
+  },
 };
+
+// おでんの種類（セット注文時に提供する具材を選ぶ）
+const ODEN_ITEMS = ["大根", "卵", "餅巾着", "こんにゃく", "ソーセージ", "牛すじ", "平天", "ロールキャベツ"];
 
 // ===== utils =====
 const fmt = n => n.toLocaleString("ja-JP") + "円";
@@ -478,6 +489,8 @@ function OrderScreen({ tableId, session, table, liveData, persistLive, onBack, o
   const [showCheckout, setShowCheckout] = useState(false);
   const [checkoutName, setCheckoutName] = useState(session?.customerName || "");
   const [view, setView] = useState("menu");
+  const [odenModalItem, setOdenModalItem] = useState(null); // おでんセットの具材選択中のメニュー項目
+  const [odenSelected, setOdenSelected] = useState([]);
 
   if (!session) return (
     <div style={S.root}>
@@ -506,12 +519,29 @@ function OrderScreen({ tableId, session, table, liveData, persistLive, onBack, o
     }));
   }
 
+  function toggleOdenIngredient(name) {
+    setOdenSelected(prev => prev.includes(name) ? prev.filter(n => n !== name) : [...prev, name]);
+  }
+
+  function confirmOdenAdd() {
+    if (!odenModalItem) return;
+    const combo = odenSelected.join("・");
+    const cartId = `${odenModalItem.id}__${combo}`;
+    setCart(prev => {
+      const ex = prev.find(x => x.id === cartId);
+      return ex
+        ? prev.map(x => x.id === cartId ? { ...x, qty: x.qty + 1 } : x)
+        : [...prev, { ...odenModalItem, id: cartId, baseId: odenModalItem.id, qty: 1, itemNote: combo }];
+    });
+    setOdenModalItem(null); setOdenSelected([]);
+  }
+
   function sendOrder() {
     if (cart.length === 0) return;
     const newOrders = cart.map(item => ({
       id: Date.now() + Math.random(),
-      itemId: item.id, itemName: item.name, price: item.price, qty: item.qty,
-      note: noteInput, status: "ordered",
+      itemId: item.baseId || item.id, itemName: item.name, price: item.price, qty: item.qty,
+      note: [item.itemNote, noteInput].filter(Boolean).join(" / "), status: "ordered",
       orderedAt: Date.now(), orderedAtStr: nowStr(),
     }));
     persistLive({
@@ -580,10 +610,12 @@ function OrderScreen({ tableId, session, table, liveData, persistLive, onBack, o
           </div>
           <div style={S.menuGrid}>
             {MENU[activeCat].items.map(item => {
-              const inCart = cart.find(x => x.id === item.id);
+              const inCart = item.odenSet
+                ? (cart.some(x => x.baseId === item.id) ? { qty: cart.filter(x => x.baseId === item.id).reduce((s, x) => s + x.qty, 0) } : null)
+                : cart.find(x => x.id === item.id);
               return (
                 <button key={item.id} style={{ ...S.menuItem, ...(inCart ? { borderColor: MENU[activeCat].color, background: "#2a1f0d" } : {}) }}
-                  onClick={() => addToCart(item)}>
+                  onClick={() => item.odenSet ? (setOdenModalItem(item), setOdenSelected([])) : addToCart(item)}>
                   {inCart && <span style={S.badge}>{inCart.qty}</span>}
                   <span style={S.menuName}>{item.name}</span>
                   {item.unit && <span style={S.menuUnit}>{item.unit}</span>}
@@ -597,7 +629,7 @@ function OrderScreen({ tableId, session, table, liveData, persistLive, onBack, o
               <div style={S.cartTitle}>🛒 追加注文</div>
               {cart.map(item => (
                 <div key={item.id} style={S.cartRow}>
-                  <span style={S.cartName}>{item.name}</span>
+                  <span style={S.cartName}>{item.name}{item.itemNote ? <span style={{ color: "#888", fontSize: 11 }}>　{item.itemNote}</span> : ""}</span>
                   <div style={S.qtyRow}>
                     <button style={S.qBtn} onClick={() => changeQty(item.id, -1)}>－</button>
                     <span style={S.qNum}>{item.qty}</span>
@@ -688,6 +720,29 @@ function OrderScreen({ tableId, session, table, liveData, persistLive, onBack, o
             <div style={S.modalBtns}>
               <button style={S.btnGray} onClick={() => setShowCheckout(false)}>戻る</button>
               <button style={S.btnGold} onClick={() => { onCheckout(tableId, checkoutName); setShowCheckout(false); }}>会計完了</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {odenModalItem && (
+        <div style={S.overlay} onClick={() => setOdenModalItem(null)}>
+          <div style={S.modal} onClick={e => e.stopPropagation()}>
+            <div style={S.modalTitle}>🍲 {odenModalItem.name} — 具材を選択</div>
+            <div style={{ fontSize: 12, color: "#888", marginBottom: 10 }}>提供するおでんの種類をタップしてください（複数選択可）</div>
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+              {ODEN_ITEMS.map(name => {
+                const sel = odenSelected.includes(name);
+                return (
+                  <button key={name}
+                    style={{ ...S.catBtn, ...(sel ? { background: MENU.oden.color, color: "#fff", borderColor: MENU.oden.color } : {}) }}
+                    onClick={() => toggleOdenIngredient(name)}>{name}</button>
+                );
+              })}
+            </div>
+            <div style={S.modalBtns}>
+              <button style={S.btnGray} onClick={() => setOdenModalItem(null)}>キャンセル</button>
+              <button style={S.btnGold} onClick={confirmOdenAdd}>追加</button>
             </div>
           </div>
         </div>
@@ -2362,8 +2417,8 @@ function AIStrategyTab({ ordersData, dailiesData, customers }) {
     const bottomItems  = Object.entries(itemSales).sort((a, b) => a[1] - b[1]).slice(0, 3);
 
     // カテゴリ別売上
-    const catSales = { ドリンク: 0, 串もの: 0, 揚げ物: 0, スピード: 0, 一品: 0, "1000べろ": 0 };
-    const catMap = { d: "ドリンク", k: "串もの", a: "揚げ物", s: "スピード", i: "一品", sp: "1000べろ" };
+    const catSales = { ドリンク: 0, 串もの: 0, 揚げ物: 0, スピード: 0, 一品: 0, "1000べろ": 0, おでん: 0 };
+    const catMap = { d: "ドリンク", k: "串もの", a: "揚げ物", s: "スピード", i: "一品", sp: "1000べろ", od: "おでん" };
     dayOrders.forEach(o => o.items.forEach(i => {
       const cat = catMap[i.itemId?.match(/^([a-z]+)/)?.[1]] || "その他";
       if (cat in catSales) catSales[cat] += i.price * i.qty;
