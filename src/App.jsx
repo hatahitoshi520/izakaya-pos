@@ -162,13 +162,26 @@ function useSharedState(key, shared = true) {
     return () => clearInterval(t);
   }, [load]);
 
-  const persist = useCallback(async (next) => {
+  // updater関数（prev => next）を受け取り、書き込み直前にサーバーの最新値を
+  // 取り直してから適用する（read-modify-write）。ポーリング間隔（最大3秒）
+  // の間に他の端末が書き込んだ変更を、古いローカルの値で上書きして消して
+  // しまわないようにするための仕組み。updaterでなく値を直接渡した場合は
+  // 従来どおりその値でそのまま上書きする。
+  const persist = useCallback(async (updater) => {
     versionRef.current += 1;
+    let base = val;
+    if (typeof updater === "function") {
+      try {
+        const r = await window.storage.get(key, shared);
+        if (r) base = JSON.parse(r.value);
+      } catch { /* 新規キーなど: ローカルの値をbaseのまま使う */ }
+    }
+    const next = typeof updater === "function" ? updater(base) : updater;
     const raw = JSON.stringify(next);
     lastRawRef.current = raw;
     setVal(next);
     try { await window.storage.set(key, raw, shared); } catch (e) { console.error(e); }
-  }, [key, shared]);
+  }, [key, shared, val]);
 
   return [val, persist, ready];
 }
@@ -201,7 +214,10 @@ export default function App() {
       customerName: customerName || tbl?.name || "",
       orders: [],
     };
-    persistLive({ ...liveData, sessions: [...liveData.sessions, session], updatedAt: Date.now() });
+    persistLive(prev => {
+      const cur = prev || liveData;
+      return { ...cur, sessions: [...cur.sessions, session], updatedAt: Date.now() };
+    });
   }
 
   async function checkout(tableId, customerName) {
@@ -217,28 +233,26 @@ export default function App() {
       dateKey: todayKey(),
     };
 
-    // 顧客更新
     const name = record.customerName;
-    const ex = customersData.find(c => c.name === name);
-    let newCustomers;
-    if (ex) {
-      const fav = { ...ex.favoriteItems };
-      session.orders.forEach(o => { fav[o.itemName] = (fav[o.itemName] || 0) + o.qty; });
-      newCustomers = customersData.map(c => c.name === name
-        ? { ...c, visits: c.visits + 1, totalSpent: c.totalSpent + total, lastVisit: Date.now(), favoriteItems: fav }
-        : c);
-    } else {
+
+    await persistOrders(prev => [record, ...(prev || ordersData)]);
+    await persistCustomers(prev => {
+      const cur = prev || customersData;
+      const ex = cur.find(c => c.name === name);
+      if (ex) {
+        const fav = { ...ex.favoriteItems };
+        session.orders.forEach(o => { fav[o.itemName] = (fav[o.itemName] || 0) + o.qty; });
+        return cur.map(c => c.name === name
+          ? { ...c, visits: c.visits + 1, totalSpent: c.totalSpent + total, lastVisit: Date.now(), favoriteItems: fav }
+          : c);
+      }
       const fav = {};
       session.orders.forEach(o => { fav[o.itemName] = (fav[o.itemName] || 0) + o.qty; });
-      newCustomers = [...customersData, { id: Date.now(), name, visits: 1, totalSpent: total, firstVisit: Date.now(), lastVisit: Date.now(), favoriteItems: fav }];
-    }
-
-    await persistOrders([record, ...ordersData]);
-    await persistCustomers(newCustomers);
-    await persistLive({
-      ...liveData,
-      sessions: liveData.sessions.filter(s => s.tableId !== tableId),
-      updatedAt: Date.now(),
+      return [...cur, { id: Date.now(), name, visits: 1, totalSpent: total, firstVisit: Date.now(), lastVisit: Date.now(), favoriteItems: fav }];
+    });
+    await persistLive(prev => {
+      const cur = prev || liveData;
+      return { ...cur, sessions: cur.sessions.filter(s => s.tableId !== tableId), updatedAt: Date.now() };
     });
     setOpenTableId(null);
   }
@@ -265,8 +279,8 @@ export default function App() {
     };
 
     // セッションのみリセット（注文ログは保持）
-    await persistLive({ ...liveData, sessions: [], updatedAt: Date.now() });
-    await persistDailies([report, ...dailiesData.filter(d => d.date !== today)]);
+    await persistLive(prev => ({ ...(prev || liveData), sessions: [], updatedAt: Date.now() }));
+    await persistDailies(prev => [report, ...(prev || dailiesData).filter(d => d.date !== today)]);
     setClosedReport(report);
     setShowCloseModal(false);
   }
@@ -468,7 +482,10 @@ function TableView({ liveData, persistLive, ordersData, onSelectTable, openTable
               <button style={S.btnGray} onClick={() => setAddModal(false)}>キャンセル</button>
               <button style={S.btnGold} onClick={() => {
                 const t = { id: Date.now(), name: newName || `${liveData.tables.length + 1}卓`, seats: parseInt(newSeats) || 4 };
-                persistLive({ ...liveData, tables: [...liveData.tables, t], updatedAt: Date.now() });
+                persistLive(prev => {
+                  const cur = prev || liveData;
+                  return { ...cur, tables: [...cur.tables, t], updatedAt: Date.now() };
+                });
                 setAddModal(false); setNewName(""); setNewSeats("4");
               }}>追加</button>
             </div>
@@ -544,30 +561,39 @@ function OrderScreen({ tableId, session, table, liveData, persistLive, onBack, o
       note: [item.itemNote, noteInput].filter(Boolean).join(" / "), status: "ordered",
       orderedAt: Date.now(), orderedAtStr: nowStr(),
     }));
-    persistLive({
-      ...liveData,
-      sessions: liveData.sessions.map(s => s.tableId === tableId
-        ? { ...s, orders: [...s.orders, ...newOrders] } : s),
-      updatedAt: Date.now(),
+    persistLive(prev => {
+      const cur = prev || liveData;
+      return {
+        ...cur,
+        sessions: cur.sessions.map(s => s.tableId === tableId
+          ? { ...s, orders: [...s.orders, ...newOrders] } : s),
+        updatedAt: Date.now(),
+      };
     });
     setCart([]); setNoteInput(""); setView("history");
   }
 
   function markStatus(orderId, status) {
-    persistLive({
-      ...liveData,
-      sessions: liveData.sessions.map(s => s.tableId === tableId
-        ? { ...s, orders: s.orders.map(o => o.id === orderId ? { ...o, status } : o) } : s),
-      updatedAt: Date.now(),
+    persistLive(prev => {
+      const cur = prev || liveData;
+      return {
+        ...cur,
+        sessions: cur.sessions.map(s => s.tableId === tableId
+          ? { ...s, orders: s.orders.map(o => o.id === orderId ? { ...o, status } : o) } : s),
+        updatedAt: Date.now(),
+      };
     });
   }
 
   function cancelItem(orderId) {
-    persistLive({
-      ...liveData,
-      sessions: liveData.sessions.map(s => s.tableId === tableId
-        ? { ...s, orders: s.orders.filter(o => o.id !== orderId) } : s),
-      updatedAt: Date.now(),
+    persistLive(prev => {
+      const cur = prev || liveData;
+      return {
+        ...cur,
+        sessions: cur.sessions.map(s => s.tableId === tableId
+          ? { ...s, orders: s.orders.filter(o => o.id !== orderId) } : s),
+        updatedAt: Date.now(),
+      };
     });
   }
 
@@ -762,11 +788,14 @@ function KitchenView({ liveData, persistLive }) {
   }).sort((a, b) => a.orderedAt - b.orderedAt);
 
   function markStatus(tableId, orderId, status) {
-    persistLive({
-      ...liveData,
-      sessions: liveData.sessions.map(s => s.tableId === tableId
-        ? { ...s, orders: s.orders.map(o => o.id === orderId ? { ...o, status } : o) } : s),
-      updatedAt: Date.now(),
+    persistLive(prev => {
+      const cur = prev || liveData;
+      return {
+        ...cur,
+        sessions: cur.sessions.map(s => s.tableId === tableId
+          ? { ...s, orders: s.orders.map(o => o.id === orderId ? { ...o, status } : o) } : s),
+        updatedAt: Date.now(),
+      };
     });
   }
 
