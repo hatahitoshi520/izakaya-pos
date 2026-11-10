@@ -508,6 +508,8 @@ function OrderScreen({ tableId, session, table, liveData, persistLive, onBack, o
   const [view, setView] = useState("menu");
   const [odenModalItem, setOdenModalItem] = useState(null); // おでんセットの具材選択中のメニュー項目
   const [odenSelected, setOdenSelected] = useState([]);
+  const [customName, setCustomName] = useState("");   // メニューにない商品の名前
+  const [customPrice, setCustomPrice] = useState("");  // メニューにない商品の金額
 
   if (!session) return (
     <div style={S.root}>
@@ -534,6 +536,15 @@ function OrderScreen({ tableId, session, table, liveData, persistLive, onBack, o
       const nq = x.qty + d;
       return nq <= 0 ? [] : [{ ...x, qty: nq }];
     }));
+  }
+
+  // メニューに無い商品をその場で入力してカートに追加する
+  function addCustomItem() {
+    const name = customName.trim();
+    const price = parseInt(customPrice, 10);
+    if (!name || !price || price <= 0) return;
+    setCart(prev => [...prev, { id: `custom-${Date.now()}`, name, price, qty: 1 }]);
+    setCustomName(""); setCustomPrice("");
   }
 
   function toggleOdenIngredient(name) {
@@ -649,6 +660,15 @@ function OrderScreen({ tableId, session, table, liveData, persistLive, onBack, o
                 </button>
               );
             })}
+          </div>
+          <div style={{ margin: "0 12px 12px", background: "#1a1208", border: "1px solid #2a2010", borderRadius: 12, padding: 12 }}>
+            <div style={{ fontSize: 12, color: "#888", marginBottom: 8 }}>✍️ メニューにない商品を追加</div>
+            <div style={{ display: "flex", gap: 6 }}>
+              <input style={{ ...S.input, flex: 2 }} placeholder="商品名" value={customName} onChange={e => setCustomName(e.target.value)} />
+              <input style={{ ...S.input, flex: 1 }} type="number" placeholder="金額" value={customPrice} onChange={e => setCustomPrice(e.target.value)} />
+              <button style={{ ...S.btnGold, flex: "0 0 auto", padding: "0 16px", width: "auto" }}
+                onClick={addCustomItem} disabled={!customName.trim() || !customPrice}>追加</button>
+            </div>
           </div>
           {cart.length > 0 && (
             <div style={S.cartBox}>
