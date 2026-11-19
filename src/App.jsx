@@ -1188,8 +1188,19 @@ function ReceiptScanner({ onParsed }) {
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
   // レスポンスの中身からエラー種別を判定（Gemini APIのエラー形式に対応）
+  // Googleの429は「1分あたりの上限」と「1日あたりの上限」の両方で起こるが、
+  // 1日あたりの上限は数時間待たない限りリトライしても無駄なので区別する
+  function isDailyQuotaExceeded(body) {
+    return !!body?.error?.details?.some(d =>
+      typeof d.violations === "object" && d.violations?.some(v => String(v.quotaId || "").includes("PerDay"))
+    );
+  }
+
   function classifyError(httpStatus, body) {
     const status = body?.error?.status || "";
+    if (httpStatus === 429 && isDailyQuotaExceeded(body)) {
+      return { kind: "daily_limit", message: "本日のAI読み取り無料利用枠を使い切りました。明日にならないと回復しません。それまでは手入力で登録してください。" };
+    }
     if (httpStatus === 429 || status === "RESOURCE_EXHAUSTED") {
       return { kind: "rate_limit", message: "リクエストが混み合っています（無料枠の上限に達した可能性があります）。少し時間をおいてから、もう一度お試しください。" };
     }
@@ -1224,8 +1235,10 @@ function ReceiptScanner({ onParsed }) {
       let errBody = null;
       try { errBody = await res.json(); } catch { /* JSON以外の応答 */ }
 
-      if (res.status === 429 && attempt < 2) {
-        // 無料枠は1分あたりの回数が少なく、Googleから「あと何秒で復帰するか」が
+      // 1日あたりの上限超過は数時間待たないと回復しないため、貴重な残り回数を
+      // リトライで無駄に消費しないよう、ここでは一切リトライしない
+      if (res.status === 429 && attempt < 2 && !isDailyQuotaExceeded(errBody)) {
+        // 1分あたりの回数制限は、Googleから「あと何秒で復帰するか」が
         // 返ってくることが多いので、それを優先して待つ（無ければ4秒）。
         // 待ちすぎ・待たなすぎを防ぐため3〜20秒の範囲に収める。
         const suggested = extractRetryDelayMs(errBody);
@@ -1284,18 +1297,11 @@ function ReceiptScanner({ onParsed }) {
   // 写真付きで手入力用にキューへ追加した）/ "fail"（キューに入れない）
   async function analyzeAndEnqueue(dataUrl, mediaType, forceQueue) {
     try {
-      let parsed = await analyzeReceipt(dataUrl, mediaType);
-      let recognized = isReceiptRecognized(parsed);
-
-      // AIの読み取り結果は毎回わずかにばらつくため、1回目で読み取れなかった
-      // 場合は諦めず、その場でもう1回だけ読み直させる（精度を底上げする）
-      if (!recognized) {
-        const retryParsed = await analyzeReceipt(dataUrl, mediaType);
-        if (isReceiptRecognized(retryParsed)) {
-          parsed = retryParsed;
-          recognized = true;
-        }
-      }
+      // 無料枠が1日あたりごく少数しか使えないため、以前はここで読み取れな
+      // かった場合にもう1回読み直させていたが、それをやめて1枚につき1回の
+      // 呼び出しに抑え、残り回数をなるべく多くのレシートに使えるようにする
+      const parsed = await analyzeReceipt(dataUrl, mediaType);
+      const recognized = isReceiptRecognized(parsed);
 
       if (recognized) {
         onParsed({
@@ -1327,13 +1333,15 @@ function ReceiptScanner({ onParsed }) {
       // APIキー未設定・利用上限などは、何回撮り直しても解決しないエラー
       // なので、理由が分かる形で即座に手入力用キューへ回す
       const info = e.info || { kind: "unknown", message: e.message || "読み取りに失敗しました。" };
-      if (["auth", "billing", "rate_limit", "server"].includes(info.kind) || forceQueue) {
+      if (["auth", "billing", "rate_limit", "daily_limit", "server"].includes(info.kind) || forceQueue) {
         onParsed({
           date: "", name: "", amount: "", category: "other", memo: "", receiptNo: "",
           photo: dataUrl, status: "manual",
           errorMsg: info.message,
         });
-        return "manual";
+        // 1日の上限超過は何度撮っても同じ結果になるだけなので、呼び出し元で
+        // 自動検知を止められるよう区別して知らせる
+        return info.kind === "daily_limit" ? "daily_limit" : "manual";
       }
       return "fail";
     }
@@ -1445,20 +1453,28 @@ function ReceiptScanner({ onParsed }) {
     const result = await analyzeAndEnqueue(dataUrl, "image/jpeg", forceQueue);
 
     setChecking(false);
-    if (result === "success" || result === "manual") {
+    if (result === "success" || result === "manual" || result === "daily_limit") {
       failStreakRef.current = 0;
       captureCountRef.current += 1;
       setCaptureCount(captureCountRef.current);
     } else {
       failStreakRef.current += 1;
     }
-    setFlash(result);
+    setFlash(result === "daily_limit" ? "manual" : result);
     setHint(
-      result === "success" ? "読み取りました。次のレシートに入れ替えてください" :
-      result === "manual"  ? "自動では読み取れませんでした。手入力用に一覧へ追加しました" :
+      result === "success"     ? "読み取りました。次のレシートに入れ替えてください" :
+      result === "manual"      ? "自動では読み取れませんでした。手入力用に一覧へ追加しました" :
+      result === "daily_limit" ? "本日のAI読み取り無料枠を使い切りました。手入力用に一覧へ追加しました" :
       "うまく読み取れませんでした。もう一度かざしてください"
     );
     setTimeout(() => setFlash(null), 350);
+
+    // 1日の上限に達した場合、これ以上かざしても同じ結果になるだけなので
+    // 自動検知を止める（＝上限到達時と同様、一時停止状態を解除しない）
+    if (result === "daily_limit") {
+      setHint("本日のAI読み取り無料枠を使い切りました。以降は下の「手入力で1件だけ追加」からご登録ください");
+      return;
+    }
 
     // 上限に達した場合は、あえて一時停止状態を解除しない
     // （＝自動検知も手動ボタンも、はっきり止める）
