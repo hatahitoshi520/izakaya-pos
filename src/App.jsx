@@ -1202,7 +1202,15 @@ function ReceiptScanner({ onParsed }) {
     return { kind: "unknown", message: "読み取りに失敗しました。画像の向き・明るさを変えてもう一度お試しください。" };
   }
 
-  // /api/gemini を叩き、429（無料枠のレート制限）の場合のみ1回だけ自動リトライする
+  // Googleのレート制限エラーは、あと何秒待てば再試行できるかを
+  // retryDelay（例:"17s"）として返してくるので、それを読み取る
+  function extractRetryDelayMs(errBody) {
+    const detail = errBody?.error?.details?.find(d => typeof d["@type"] === "string" && d["@type"].includes("RetryInfo"));
+    const sec = parseFloat(detail?.retryDelay);
+    return Number.isFinite(sec) ? sec * 1000 : null;
+  }
+
+  // /api/gemini を叩き、429（無料枠のレート制限）の場合は最大2回まで自動リトライする
   // （APIキーはサーバー側だけに保持され、ブラウザには一切渡らない。
   //   Google AI Studioの無料枠を使うため、通常の利用量なら費用は発生しない）
   async function callGeminiWithRetry(body, attempt = 0) {
@@ -1216,8 +1224,13 @@ function ReceiptScanner({ onParsed }) {
       let errBody = null;
       try { errBody = await res.json(); } catch { /* JSON以外の応答 */ }
 
-      if (res.status === 429 && attempt < 1) {
-        await sleep(4000); // 無料枠のレート制限（1分あたりの回数制限）を想定した待機
+      if (res.status === 429 && attempt < 2) {
+        // 無料枠は1分あたりの回数が少なく、Googleから「あと何秒で復帰するか」が
+        // 返ってくることが多いので、それを優先して待つ（無ければ4秒）。
+        // 待ちすぎ・待たなすぎを防ぐため3〜20秒の範囲に収める。
+        const suggested = extractRetryDelayMs(errBody);
+        const waitMs = suggested != null ? Math.min(Math.max(suggested, 3000), 20000) : 4000;
+        await sleep(waitMs);
         return callGeminiWithRetry(body, attempt + 1);
       }
 
